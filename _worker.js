@@ -1,5 +1,5 @@
-// Cloudflare Worker - 服务器优选工具 最终版 v11
-// 基于 v10 优化：仅优选IP模式输出25个，其中优选IP最多9个，其余由内置优选域名和GitHub/BestCF补齐；普通组合优选IP仍最多6个。
+// Cloudflare Worker - 服务器优选工具 最终版 v13
+// 基于 v12 优化：GitHub/BestCF 中 CF- 开头节点最多 3 个，过滤 CF-IPv6；其余规则保持稳定。
 // 仅保留优选域名、优选IP、GitHub、上报和节点生成功能
 // 修复记录：已修正 VMess 协议下节点名称包含中文导致 Error 1101 的问题
 
@@ -28,6 +28,7 @@ const ONLY_IP_TARGET_NODES = 25;             // 仅启用优选IP时也输出 25
 const ONLY_IP_DOMAIN_SEED_NODES = 3;          // 仅优选IP模式：先从内置优选域名池挑 3 个作为前置稳定入口
 const ONLY_IP_PREFERRED_IP_MAX_NODES = 9;     // 仅优选IP模式：优选IP最多 9 个，其余由内置域名和 GitHub/BestCF 补齐
 const PREFERRED_IP_OUTPUT_MAX_NODES = 6;      // 普通组合中，优选IP质量波动较大，输出中优选IP最多控制在 6 个
+const CF_PREFIX_GITHUB_OUTPUT_MAX_NODES = 3; // GitHub/BestCF 中 CF- 开头节点最多保留 3 个，避免 CF-IPDB/VPS789 类节点占比过高
 const MAX_NODES_HARD_LIMIT = 30;           // 硬限制，防止 URL 参数传入过大导致客户端测速失败
 const MAX_CANDIDATE_POOL_SIZE = 60;        // 后台候选池上限：先按 UUID 打散，再从最多 60 个候选中按规则输出 25/30 个
 const memoryCache = new Map();
@@ -399,6 +400,36 @@ function limitPreparedCandidateBuckets(preparedBuckets, sourceFlags, maxCandidat
 }
 
 
+
+function decodeLinkRemark(link) {
+    const raw = String(link || '').split('#')[1] || '';
+    try { return decodeURIComponent(raw); } catch (_) { return raw; }
+}
+
+function isCfPrefixedCandidateLink(link) {
+    return /^CF-/i.test(decodeLinkRemark(link).trim());
+}
+
+function isCfIpv6CandidateLink(link) {
+    const name = decodeLinkRemark(link).trim();
+    return /^CF-IPv6/i.test(name) || /^CF[-_\s]*V6/i.test(name) || /\bIPv6\b/i.test(name);
+}
+
+function limitGithubCfPrefixedLinks(links, maxCfPrefixed = CF_PREFIX_GITHUB_OUTPUT_MAX_NODES) {
+    const result = [];
+    let cfTaken = 0;
+    for (const link of Array.isArray(links) ? links : []) {
+        if (isCfPrefixedCandidateLink(link)) {
+            // CF-IPv6 类节点在手机和部分客户端上表现波动较大，直接过滤，不参与补位。
+            if (isCfIpv6CandidateLink(link)) continue;
+            if (cfTaken >= maxCfPrefixed) continue;
+            cfTaken++;
+        }
+        result.push(link);
+    }
+    return result;
+}
+
 function estimateOnlyIpModeOutputCount(sourceBuckets, target) {
     const seen = new Set();
     let count = 0;
@@ -420,7 +451,7 @@ function estimateOnlyIpModeOutputCount(sourceBuckets, target) {
     // 仅优选IP模式中，优选IP最多 9 个；其余优先用内置域名池，再用 GitHub/BestCF 补齐。
     take(sourceBuckets?.ip || [], ONLY_IP_PREFERRED_IP_MAX_NODES);
     take(sourceBuckets?.domainSeed || []);
-    take(sourceBuckets?.github || []);
+    take(limitGithubCfPrefixedLinks(sourceBuckets?.github || []));
     return count;
 }
 
@@ -447,7 +478,7 @@ function buildBalancedCandidateLinks(sourceBuckets, url, request, maxNodes, sour
     const domainSeed = prepareBucket('domainSeed');
     let allDomain = prepareBucket('domain');
     let allIp = prepareBucket('ip');
-    let allGithub = prepareBucket('github');
+    let allGithub = limitGithubCfPrefixedLinks(prepareBucket('github'));
     const onlyIpMode = isOnlyIpSourceFlags(sourceFlags);
 
     const candidateLimit = Math.max(MAX_CANDIDATE_POOL_SIZE - (origin.length > 0 ? 1 : 0), 1);
