@@ -1,11 +1,9 @@
-// Cloudflare Worker - 服务器优选工具 最终版 v6
-// 基于当前线上 _worker.js 更新：候选池上限 60；仅优选IP输出18；其余有效组合默认25、可top=30；保留旧链接兼容。
+// Cloudflare Worker - 服务器优选工具 最终版 v7
+// 基于 v6 优化：仅优选IP模式先取3个内置优选域名，再取优选IP，最后不足18时从其他池补位；保留旧链接兼容。
 // 仅保留优选域名、优选IP、GitHub、上报和节点生成功能
 // 修复记录：已修正 VMess 协议下节点名称包含中文导致 Error 1101 的问题
 
 // 默认配置
-let customPreferredIPs = [];
-let customPreferredDomains = [];
 let epd = true;  // 启用优选域名
 let epi = true;  // 启用优选IP
 let egi = true;  // 启用GitHub优选
@@ -27,6 +25,7 @@ const DEFAULT_MAX_NODES = 25;              // 默认输出 25 个节点；普通
 const NORMAL_MIN_NODES = 25;               // 除“仅优选IP”外，其余有效组合默认不少于 25 个
 const NORMAL_MAX_NODES = 30;               // 除“仅优选IP”外，其余有效组合允许输出到 30 个
 const ONLY_IP_MAX_NODES = 18;              // 仅启用优选IP时控制在 18 个，避免动态IP源不足或质量波动拖垮测速
+const ONLY_IP_DOMAIN_SEED_NODES = 3;          // 仅优选IP模式：先从内置优选域名池挑 3 个作为前置稳定入口
 const MAX_NODES_HARD_LIMIT = 30;           // 硬限制，防止 URL 参数传入过大导致客户端测速失败
 const MAX_CANDIDATE_POOL_SIZE = 60;        // 后台候选池上限：先按 UUID 打散，再从最多 60 个候选中按规则输出 18/25/30 个
 const memoryCache = new Map();
@@ -62,8 +61,6 @@ function isBlockedPreferredHost(host) {
 
 // 甬哥维护域名：yg1 ~ yg11，作为备用域名池，避免一次性塞太多，默认只放前几个。
 const YONGGE_DOMAINS = Array.from({ length: 11 }, (_, i) => `yg${i + 1}.ygkkk.dpdns.org`);
-const LA_MODE_DEFAULT_TOP = 25;
-const TEAM_MODE_DEFAULT_TOP = 25;           // 多人共用模式也控制在 20～25，避免手机端批量测速失败
 
 function clampNumber(value, min, max, fallback) {
     const n = Number.parseInt(value, 10);
@@ -349,10 +346,6 @@ function resolveTargetNodeCount(maxNodes, sourceFlags = {}) {
     return normalizeOutputLimit(maxNodes);
 }
 
-function limitLinks(links, maxNodes) {
-    const limit = normalizeOutputLimit(maxNodes);
-    return links.slice(0, limit);
-}
 
 function dedupeLinkList(links) {
     return dedupeLinks(Array.isArray(links) ? links : []);
@@ -407,6 +400,32 @@ function limitPreparedCandidateBuckets(preparedBuckets, sourceFlags, maxCandidat
     return result;
 }
 
+
+function estimateOnlyIpModeOutputCount(sourceBuckets, target) {
+    const seen = new Set();
+    let count = 0;
+
+    function take(links, limit = Number.POSITIVE_INFINITY) {
+        let taken = 0;
+        for (const link of dedupeLinkList(links || [])) {
+            if (count >= target || taken >= limit) break;
+            const key = String(link).split('#')[0];
+            if (seen.has(key)) continue;
+            seen.add(key);
+            count++;
+            taken++;
+        }
+    }
+
+    take(sourceBuckets?.origin || [], 1);
+    take(sourceBuckets?.domainSeed || [], ONLY_IP_DOMAIN_SEED_NODES);
+    take(sourceBuckets?.ip || []);
+    take(sourceBuckets?.domain || []);
+    take(sourceBuckets?.github || []);
+    take(sourceBuckets?.domainSeed || []);
+    return count;
+}
+
 function buildBalancedCandidateLinks(sourceBuckets, url, request, maxNodes, sourceFlags) {
     const target = resolveTargetNodeCount(maxNodes, sourceFlags);
     const result = [];
@@ -427,6 +446,7 @@ function buildBalancedCandidateLinks(sourceBuckets, url, request, maxNodes, sour
     }
 
     const origin = prepareBucket('origin');
+    const domainSeed = prepareBucket('domainSeed');
     let allDomain = prepareBucket('domain');
     let allIp = prepareBucket('ip');
     let allGithub = prepareBucket('github');
@@ -450,13 +470,24 @@ function buildBalancedCandidateLinks(sourceBuckets, url, request, maxNodes, sour
     // 原生地址始终保留 1 个兜底，不参与大量占位。
     if (origin.length > 0) pushOne(origin[0]);
 
-    // 仅启用优选IP时：优先取动态优选IP；不足 18 时，再从优选域名池、GitHub/BestCF池补位。
-    // 这样解决“只开优选IP只有十几个节点”的问题，同时不把目标数拉高到 25+。
+    // 仅启用优选IP时：
+    // 1）先从“内置优选域名池”按 UUID 打散后挑 3 个，作为稳定前置入口；
+    // 2）再优先取动态优选 IP；
+    // 3）如果总数不足 18，再从已懒加载的动态域名池、GitHub/BestCF池、剩余内置域名池依次补位。
     if (onlyIpMode) {
+        const seededDomainQuota = Math.min(ONLY_IP_DOMAIN_SEED_NODES, Math.max(target - result.length, 0));
+        let seedCursor = 0;
+        let seededTaken = 0;
+        while (seedCursor < domainSeed.length && seededTaken < seededDomainQuota && result.length < target) {
+            if (pushOne(domainSeed[seedCursor])) seededTaken++;
+            seedCursor++;
+        }
+
         const fallbackBuckets = [
             { name: 'ip', items: allIp, cursor: 0 },
             { name: 'domain-fill', items: allDomain, cursor: 0 },
-            { name: 'github-fill', items: allGithub, cursor: 0 }
+            { name: 'github-fill', items: allGithub, cursor: 0 },
+            { name: 'domain-seed-rest', items: domainSeed, cursor: seedCursor }
         ].filter(bucket => bucket.items.length > 0);
 
         for (const bucket of fallbackBuckets) {
@@ -564,16 +595,6 @@ const directDomains = [
 // 默认优选IP来源URL：使用 DustinWin/BestCF 通用 CF 优选 IP 源；也可在页面 GitHub 优选URL中覆盖。
 const defaultIPURL = BESTCF_IP_URL;
 
-// UUID验证
-function isValidUUID(str) {
-    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    return uuidRegex.test(str);
-}
-
-// 从环境变量获取配置
-function getConfigValue(key, defaultValue) {
-    return defaultValue || '';
-}
 
 // 获取动态IP列表（支持IPv4/IPv6和运营商筛选）
 async function fetchDynamicIPs(ipv4Enabled = true, ipv6Enabled = true, ispMobile = true, ispUnicom = true, ispTelecom = true) {
@@ -997,48 +1018,16 @@ function generateVMessLinksFromSource(list, user, workerDomain, disableNonTLS = 
     return links;
 }
 
-// 从GitHub IP生成链接（VLESS）
-function generateLinksFromNewIPs(list, user, workerDomain, customPath = '/', echConfig = null) {
-    const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
-    const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
-    const links = [];
-    const wsPath = customPath || '/';
-    const proto = 'vless';
-    const echSuffix = echConfig ? `&alpn=h3%2Ch2%2Chttp%2F1.1&ech=${encodeURIComponent(echConfig)}` : '';
-    
-    list.forEach(item => {
-        const nodeName = item.name.replace(/\s/g, '_');
-        const port = item.port;
-        
-        if (CF_HTTPS_PORTS.includes(port)) {
-            const wsNodeName = `${nodeName}-${port}-WS-TLS`;
-            const link = `${proto}://${user}@${item.ip}:${port}?encryption=none&security=tls&sni=${workerDomain}&fp=chrome&type=ws&host=${workerDomain}&path=${wsPath}${echSuffix}#${encodeURIComponent(wsNodeName)}`;
-            links.push(link);
-        } else if (CF_HTTP_PORTS.includes(port)) {
-            const wsNodeName = `${nodeName}-${port}-WS`;
-            const link = `${proto}://${user}@${item.ip}:${port}?encryption=none&security=none&type=ws&host=${workerDomain}&path=${wsPath}#${encodeURIComponent(wsNodeName)}`;
-            links.push(link);
-        } else {
-            const wsNodeName = `${nodeName}-${port}-WS-TLS`;
-            const link = `${proto}://${user}@${item.ip}:${port}?encryption=none&security=tls&sni=${workerDomain}&fp=chrome&type=ws&host=${workerDomain}&path=${wsPath}${echSuffix}#${encodeURIComponent(wsNodeName)}`;
-            links.push(link);
-        }
-    });
-    return links;
-}
-
 // 生成订阅内容
 async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, evEnabled, etEnabled, vmEnabled, disableNonTLS, customPath, echConfig = null, maxNodes = DEFAULT_MAX_NODES, sourceFlags = { epd: true, epi: true, egi: true }) {
     const url = new URL(request.url);
-    const finalLinks = [];
-    const sourceBuckets = { origin: [], domain: [], ip: [], github: [] };
+    const sourceBuckets = { origin: [], domainSeed: [], domain: [], ip: [], github: [] };
     const workerDomain = url.hostname;  // workerDomain始终是请求的hostname
     const nodeDomain = customDomain || url.hostname;  // 用户输入的域名用于生成节点时的host/sni
     const target = url.searchParams.get('target') || 'base64';
     const wsPath = normalizeWsPath(customPath || '/');
     const profile = url.searchParams.get('mode') || url.searchParams.get('profile') || '';
     const laMode = isLosAngelesMode(profile);
-    const teamMode = isTeamMode(profile) || ['yes', 'true', '1', 'on'].includes(String(url.searchParams.get('team') || '').toLowerCase());
     const onlyIpMode = isOnlyIpSourceFlags(sourceFlags);
     const maxOutputNodes = resolveTargetNodeCount(maxNodes, sourceFlags);
 
@@ -1058,21 +1047,55 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
             generated.push(...generateVMessLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath, echConfig));
         }
 
-        const bucketName = ['origin', 'domain', 'ip', 'github'].includes(sourceName) ? sourceName : 'github';
+        const bucketName = ['origin', 'domainSeed', 'domain', 'ip', 'github'].includes(sourceName) ? sourceName : 'github';
         sourceBuckets[bucketName].push(...generated);
-        finalLinks.push(...generated);
     }
 
     // 原生地址
     await addNodesFromList([{ ip: workerDomain, isp: '原生地址' }], 'origin');
 
-    // 优选域名：内置稳定域名 + 洛杉矶模式下少量补充 BestCF 动态域名
-    if (sourceFlags.epd || onlyIpMode) {
-        const domainList = directDomains.map(d => ({ ip: d.domain, isp: d.name || d.domain }));
-        await addNodesFromList(domainList, 'domain');
-        // 无论是否开启 LA/team，只要启用优选域名，就补充动态域名池；最终先按 UUID 打散并控制候选池上限，再按规则输出。
+    async function addDynamicDomainSources() {
         const bestcfDomains = await cachedFetchDomainsFromUrl(BESTCF_DOMAIN_URL, 'BestCF动态域名', 25);
         await addNodesFromList(bestcfDomains, 'domain');
+    }
+
+    async function addGithubSources() {
+        try {
+            if (piu && piu.toLowerCase().startsWith('https://')) {
+                const 优选API的IP = await cachedRequestOptimizeAPI([piu]);
+                const IP列表 = 优选API的IP.map(item => parsePreferredAddress(item, 443)).filter(Boolean);
+                await addNodesFromList(IP列表, 'github');
+            } else if (piu && piu.includes('\n')) {
+                const 完整优选列表 = await 整理成数组(piu);
+                const 优选API = [], 优选IP = [];
+                for (const 元素 of 完整优选列表) {
+                    if (元素.toLowerCase().startsWith('https://')) {
+                        优选API.push(元素);
+                    } else if (!元素.toLowerCase().includes('://')) {
+                        优选IP.push(元素);
+                    }
+                }
+                if (优选API.length > 0) {
+                    优选IP.push(...await cachedRequestOptimizeAPI(优选API));
+                }
+                const IP列表 = 优选IP.map(item => parsePreferredAddress(item, 443)).filter(Boolean);
+                await addNodesFromList(IP列表, 'github');
+            } else {
+                const newIPList = await cachedFetchAndParseNewIPs(piu);
+                await addNodesFromList(newIPList, 'github');
+            }
+        } catch (error) {
+            console.error('获取优选IP失败:', error);
+        }
+    }
+
+    // 优选域名：普通模式使用内置域名 + 动态域名；仅优选IP模式先只加载内置域名，动态域名作为“不足18”时的懒加载补位。
+    if (sourceFlags.epd || onlyIpMode) {
+        const domainList = directDomains.map(d => ({ ip: d.domain, isp: d.name || d.domain }));
+        await addNodesFromList(domainList, onlyIpMode && !sourceFlags.epd ? 'domainSeed' : 'domain');
+        if (sourceFlags.epd) {
+            await addDynamicDomainSources();
+        }
     }
 
     // 优选IP：加入缓存，第三方源失败时不影响已有缓存
@@ -1102,35 +1125,20 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
         }
     }
 
-    // GitHub优选 / 自定义优选API：统一解析后交给 addNodesFromList，保证 VLESS/Trojan/VMess 选择都生效
-    if (sourceFlags.egi || onlyIpMode) {
-        try {
-            if (piu && piu.toLowerCase().startsWith('https://')) {
-                const 优选API的IP = await cachedRequestOptimizeAPI([piu]);
-                const IP列表 = 优选API的IP.map(item => parsePreferredAddress(item, 443)).filter(Boolean);
-                await addNodesFromList(IP列表, 'github');
-            } else if (piu && piu.includes('\n')) {
-                const 完整优选列表 = await 整理成数组(piu);
-                const 优选API = [], 优选IP = [];
-                for (const 元素 of 完整优选列表) {
-                    if (元素.toLowerCase().startsWith('https://')) {
-                        优选API.push(元素);
-                    } else if (!元素.toLowerCase().includes('://')) {
-                        优选IP.push(元素);
-                    }
-                }
-                if (优选API.length > 0) {
-                    优选IP.push(...await cachedRequestOptimizeAPI(优选API));
-                }
-                const IP列表 = 优选IP.map(item => parsePreferredAddress(item, 443)).filter(Boolean);
-                await addNodesFromList(IP列表, 'github');
-            } else {
-                const newIPList = await cachedFetchAndParseNewIPs(piu);
-                await addNodesFromList(newIPList, 'github');
-            }
-        } catch (error) {
-            console.error('获取优选IP失败:', error);
+    // 仅优选IP模式：先用“3个内置域名 + 优选IP”判断是否够 18；不足时才懒加载动态域名和 GitHub/BestCF 补位，减少无效请求。
+    if (onlyIpMode) {
+        const onlyIpTarget = resolveTargetNodeCount(maxNodes, sourceFlags);
+        if (estimateOnlyIpModeOutputCount(sourceBuckets, onlyIpTarget) < onlyIpTarget) {
+            await addDynamicDomainSources();
         }
+        if (estimateOnlyIpModeOutputCount(sourceBuckets, onlyIpTarget) < onlyIpTarget) {
+            await addGithubSources();
+        }
+    }
+
+    // GitHub优选 / 自定义优选API：非仅优选IP模式下，仅在 egi=yes 时启用。
+    if (sourceFlags.egi) {
+        await addGithubSources();
     }
 
     // 兼容旧订阅链接：如果没有额外填写 uid/client/user，就自动使用路径里的 UUID/Password 作为稳定打散种子。
@@ -1746,7 +1754,7 @@ function generateHomePage(scuValue) {
             <div class="form-group">
                 <label>最大输出节点数</label>
                 <input type="number" id="maxNodes" placeholder="普通建议25，电脑可30；仅优选IP自动18" value="25" min="18" max="30">
-                <small style="display: block; margin-top: 6px; color: #86868b; font-size: 13px;">普通组合默认 25 个、可到 30 个；仅启用优选IP时自动控制在 18 个并从其他池补位。</small>
+                <small style="display: block; margin-top: 6px; color: #86868b; font-size: 13px;">普通组合默认 25 个、可到 30 个；仅启用优选IP时先取3个内置域名，再取优选IP，不足18再补位。</small>
             </div>
 
             <div class="list-item" onclick="toggleSwitch('switchLA')">
