@@ -21,9 +21,9 @@ let customECHDomain = 'cloudflare-ech.com';
 // ===================== 优化配置区 =====================
 // Worker 内存缓存：减少每次订阅实时拉取第三方优选源导致的慢、超时、失败。
 // 注意：Cloudflare Worker 冷启动后缓存会清空，这是正常现象；如需强持久缓存，可后续接 KV。
-const CACHE_TTL_MS = 20 * 60 * 1000;       // 优选源缓存 20 分钟
-const DEFAULT_MAX_NODES = 20;              // 默认最多输出节点数，避免客户端导入太多节点卡顿
-const MAX_NODES_HARD_LIMIT = 80;           // 硬限制，防止 URL 参数传入过大
+const CACHE_TTL_MS = 60 * 60 * 1000;       // 优选源缓存 60 分钟：减少第三方源拉取，适合多人订阅
+const DEFAULT_MAX_NODES = 30;              // 默认最多输出节点数；多人使用不建议只给 5 个
+const MAX_NODES_HARD_LIMIT = 100;          // 硬限制，防止 URL 参数传入过大
 const memoryCache = new Map();
 
 const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
@@ -38,9 +38,27 @@ const BESTCF_CMCC_IP_URL = `${BESTCF_BASE}/cmcc-ip.txt`;
 const BESTCF_CUCC_IP_URL = `${BESTCF_BASE}/cucc-ip.txt`;
 const BESTCF_CTCC_IP_URL = `${BESTCF_BASE}/ctcc-ip.txt`;
 
+// 本地黑名单：用户实测不通/返回 -1 的优选域名，不再生成到订阅中。
+// 如后续某个域名恢复，可从这里移除并重新部署。
+const BLOCKED_PREFERRED_DOMAINS = new Set([
+    'bestcf.030101.xyz',
+    'bestcf.cloudflare.182682.xyz',
+    'cf.cloudflare.182682.xyz',
+    'cfip.cfcdn.vip',
+    'youxuan.cf.090227.xyz',
+    'cf.090227.xyz',
+    'cdn.2020111.xyz'
+]);
+
+function isBlockedPreferredHost(host) {
+    const value = String(host || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+    return BLOCKED_PREFERRED_DOMAINS.has(value);
+}
+
 // 甬哥维护域名：yg1 ~ yg11，作为备用域名池，避免一次性塞太多，默认只放前几个。
 const YONGGE_DOMAINS = Array.from({ length: 11 }, (_, i) => `yg${i + 1}.ygkkk.dpdns.org`);
 const LA_MODE_DEFAULT_TOP = 30;
+const TEAM_MODE_DEFAULT_TOP = 40;           // 多人共用模式默认输出更多候选入口
 
 function clampNumber(value, min, max, fallback) {
     const n = Number.parseInt(value, 10);
@@ -137,7 +155,7 @@ async function cachedFetchDomainsFromUrl(url, namePrefix = 'BestCF域名', limit
         const domains = [];
         for (const item of items) {
             const domain = item.split('#')[0].split(':')[0].trim();
-            if (!looksLikeDomain(domain) || seen.has(domain)) continue;
+            if (!looksLikeDomain(domain) || isBlockedPreferredHost(domain) || seen.has(domain)) continue;
             seen.add(domain);
             domains.push({ ip: domain, name: `${namePrefix}-${domains.length + 1}` });
             if (domains.length >= limit) break;
@@ -154,7 +172,7 @@ async function cachedFetchAddressListFromUrl(url, defaultPort = 443, limit = 80)
         const seen = new Set();
         for (const item of items) {
             const parsed = parsePreferredAddress(item, defaultPort);
-            if (!parsed) continue;
+            if (!parsed || isBlockedPreferredHost(parsed.ip)) continue;
             const id = `${parsed.ip}:${parsed.port}`;
             if (seen.has(id)) continue;
             seen.add(id);
@@ -167,6 +185,90 @@ async function cachedFetchAddressListFromUrl(url, defaultPort = 443, limit = 80)
 
 function isLosAngelesMode(value) {
     return ['la', 'lax', 'losangeles', 'los-angeles', '洛杉矶'].includes(String(value || '').trim().toLowerCase());
+}
+
+
+function isTeamMode(value) {
+    return ['team', 'multi', 'share', 'multiuser', '多人', '多人模式'].includes(String(value || '').trim().toLowerCase());
+}
+
+function normalizeIspProfile(value) {
+    const v = String(value || '').trim().toLowerCase();
+    if (!v) return '';
+    if (['auto', '自动'].includes(v)) return 'auto';
+    if (['all', 'any', 'common', 'default', '通用', '全部'].includes(v)) return 'all';
+    if (['mobile', 'cmcc', '移动', 'yd'].includes(v)) return 'mobile';
+    if (['unicom', 'cucc', '联通', 'lt'].includes(v)) return 'unicom';
+    if (['telecom', 'ctcc', 'chinanet', '电信', 'dx'].includes(v)) return 'telecom';
+    return '';
+}
+
+function inferIspFromRequest(request) {
+    // 只能作为辅助判断：用户若通过代理、公司网络或境外网络刷新订阅，识别可能不准。
+    const cf = request?.cf || {};
+    const text = `${cf.asOrganization || ''} ${cf.asn || ''}`.toLowerCase();
+    if (/mobile|cmcc|china mobile|中国移动|移动/.test(text)) return 'mobile';
+    if (/unicom|cucc|china unicom|中国联通|联通/.test(text)) return 'unicom';
+    if (/telecom|ctcc|chinanet|china telecom|中国电信|电信/.test(text)) return 'telecom';
+    return 'all';
+}
+
+function ispFlagsFromProfile(profile, fallback = { mobile: true, unicom: true, telecom: true }) {
+    const p = normalizeIspProfile(profile);
+    if (p === 'mobile') return { mobile: true, unicom: false, telecom: false };
+    if (p === 'unicom') return { mobile: false, unicom: true, telecom: false };
+    if (p === 'telecom') return { mobile: false, unicom: false, telecom: true };
+    return fallback;
+}
+
+function hashString32(input) {
+    // FNV-1a 32-bit，给 uid 做稳定打散，不依赖外部库。
+    let h = 0x811c9dc5;
+    const str = String(input || '');
+    for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+}
+
+function seededShuffle(list, seedText) {
+    const arr = list.slice();
+    let seed = hashString32(seedText) || 1;
+    function rand() {
+        seed ^= seed << 13; seed >>>= 0;
+        seed ^= seed >>> 17; seed >>>= 0;
+        seed ^= seed << 5; seed >>>= 0;
+        return (seed >>> 0) / 4294967296;
+    }
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
+
+function rotationBucket(mode) {
+    const v = String(mode || '').trim().toLowerCase();
+    const now = Date.now();
+    if (['0', 'off', 'no', 'fixed', 'none', '关闭'].includes(v)) return 'fixed';
+    if (['daily', 'day', '24h', '每天'].includes(v)) return `d${Math.floor(now / (24 * 60 * 60 * 1000))}`;
+    // 默认 12 小时一轮，既能轮换入口，又不会频繁变化。
+    return `h12-${Math.floor(now / (12 * 60 * 60 * 1000))}`;
+}
+
+function personalizeLinksForUser(links, url, request) {
+    const uid = url.searchParams.get('uid') || url.searchParams.get('client') || url.searchParams.get('user') || '';
+    const personalize = ['yes', 'true', '1', 'on'].includes(String(url.searchParams.get('personalize') || '').toLowerCase());
+    if (!uid && !personalize) return links;
+
+    const profile = url.searchParams.get('isp') || url.searchParams.get('carrier') || url.searchParams.get('operator') || 'all';
+    const mode = url.searchParams.get('mode') || url.searchParams.get('profile') || '';
+    const rotate = url.searchParams.get('rotate') || '12h';
+    const cf = request?.cf || {};
+    const fallbackIdentity = personalize ? `${cf.asn || ''}-${cf.colo || ''}-${cf.country || ''}` : '';
+    const seed = `${uid || fallbackIdentity}|${profile}|${mode}|${rotationBucket(rotate)}`;
+    return seededShuffle(links, seed);
 }
 
 function parsePreferredAddress(raw, defaultPort = 443) {
@@ -259,14 +361,7 @@ function parseProxyLink(link, index) {
 // 默认优选域名列表
 // 说明：控制在较小规模，避免 top=20 时全被域名占满；分运营商/通用优选 IP 由下方 BestCF 源补充。
 const directDomains = [
-    { name: 'BestCF-030101', domain: 'bestcf.030101.xyz' },
-    { name: 'BestCF-182682', domain: 'bestcf.cloudflare.182682.xyz' },
-    { name: 'CF-182682', domain: 'cf.cloudflare.182682.xyz' },
     { name: 'BestCF-top', domain: 'bestcf.top' },
-    { name: 'CFIP-cfcdn', domain: 'cfip.cfcdn.vip' },
-    { name: 'youxuan-cf090227', domain: 'youxuan.cf.090227.xyz' },
-    { name: 'cf090227', domain: 'cf.090227.xyz' },
-    { name: 'cdn2020111', domain: 'cdn.2020111.xyz' },
     { name: 'cf0sm', domain: 'cf.0sm.com' },
     { name: 'saas-sin-fan', domain: 'saas.sin.fan' },
     { name: 'xn-b6gac', domain: 'xn--b6gac.eu.org' },
@@ -751,9 +846,12 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
     const wsPath = normalizeWsPath(customPath || '/');
     const profile = url.searchParams.get('mode') || url.searchParams.get('profile') || '';
     const laMode = isLosAngelesMode(profile);
-    const maxOutputNodes = laMode && !url.searchParams.has('top')
-        ? LA_MODE_DEFAULT_TOP
-        : clampNumber(maxNodes, 1, MAX_NODES_HARD_LIMIT, DEFAULT_MAX_NODES);
+    const teamMode = isTeamMode(profile) || ['yes', 'true', '1', 'on'].includes(String(url.searchParams.get('team') || '').toLowerCase());
+    const maxOutputNodes = !url.searchParams.has('top') && teamMode
+        ? TEAM_MODE_DEFAULT_TOP
+        : (!url.searchParams.has('top') && laMode
+            ? LA_MODE_DEFAULT_TOP
+            : clampNumber(maxNodes, 1, MAX_NODES_HARD_LIMIT, DEFAULT_MAX_NODES));
 
     async function addNodesFromList(list) {
         if (!Array.isArray(list) || list.length === 0) return;
@@ -842,7 +940,14 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
         }
     }
 
-    let outputLinks = limitLinks(dedupeLinks(finalLinks), maxOutputNodes);
+    let candidateLinks = dedupeLinks(finalLinks);
+    // 兼容旧订阅链接：如果没有额外填写 uid/client/user，就自动使用路径里的 UUID/Password 作为稳定打散种子。
+    // 这样每个人旧链接里的 UUID 不同，也会拿到不同顺序的 20～30 个候选入口；新链接仍可显式传 uid 覆盖。
+    if (!url.searchParams.has('uid') && !url.searchParams.has('client') && !url.searchParams.has('user')) {
+        url.searchParams.set('uid', String(user || ''));
+    }
+    candidateLinks = personalizeLinksForUser(candidateLinks, url, request);
+    let outputLinks = limitLinks(candidateLinks, maxOutputNodes);
 
     if (outputLinks.length === 0) {
         const errorRemark = '所有节点获取失败';
@@ -1929,10 +2034,19 @@ export default {
             const ipv4Enabled = url.searchParams.get('ipv4') !== 'no';
             const ipv6Enabled = url.searchParams.get('ipv6') !== 'no';
             
-            // 运营商选择
-            const ispMobile = url.searchParams.get('ispMobile') !== 'no';
-            const ispUnicom = url.searchParams.get('ispUnicom') !== 'no';
-            const ispTelecom = url.searchParams.get('ispTelecom') !== 'no';
+            // 运营商选择：兼容旧参数，同时新增 isp=mobile/unicom/telecom/all/auto
+            const manualIspFlags = {
+                mobile: url.searchParams.get('ispMobile') !== 'no',
+                unicom: url.searchParams.get('ispUnicom') !== 'no',
+                telecom: url.searchParams.get('ispTelecom') !== 'no'
+            };
+            const ispParamRaw = url.searchParams.get('isp') || url.searchParams.get('carrier') || url.searchParams.get('operator') || '';
+            const ispProfile = normalizeIspProfile(ispParamRaw);
+            const effectiveIspProfile = ispProfile === 'auto' ? inferIspFromRequest(request) : ispProfile;
+            const selectedIspFlags = effectiveIspProfile ? ispFlagsFromProfile(effectiveIspProfile, manualIspFlags) : manualIspFlags;
+            const ispMobile = selectedIspFlags.mobile;
+            const ispUnicom = selectedIspFlags.unicom;
+            const ispTelecom = selectedIspFlags.telecom;
             
             // TLS控制：兼容旧订阅链接。
             // 旧链接通常没有 dkby 参数；为避免替换代码后旧链接生成逻辑突变，这里保持旧版默认：不强制仅TLS。
