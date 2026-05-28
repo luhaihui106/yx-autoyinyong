@@ -22,8 +22,10 @@ let customECHDomain = 'cloudflare-ech.com';
 // Worker 内存缓存：减少每次订阅实时拉取第三方优选源导致的慢、超时、失败。
 // 注意：Cloudflare Worker 冷启动后缓存会清空，这是正常现象；如需强持久缓存，可后续接 KV。
 const CACHE_TTL_MS = 60 * 60 * 1000;       // 优选源缓存 60 分钟：减少第三方源拉取，适合多人订阅
-const DEFAULT_MAX_NODES = 30;              // 默认最多输出节点数；多人使用不建议只给 5 个
-const MAX_NODES_HARD_LIMIT = 100;          // 硬限制，防止 URL 参数传入过大
+const DEFAULT_MAX_NODES = 25;              // 默认输出约 20～25 个节点，避免手机端全量测速被拖垮
+const BALANCED_MIN_NODES = 20;             // 有可用候选时，尽量不少于 20 个
+const BALANCED_MAX_NODES = 25;             // 无论优选域名/IP/GitHub如何搭配，默认最多 25 个
+const MAX_NODES_HARD_LIMIT = 25;           // 硬限制，防止 URL 参数传入过大导致客户端测速失败
 const memoryCache = new Map();
 
 const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
@@ -57,8 +59,8 @@ function isBlockedPreferredHost(host) {
 
 // 甬哥维护域名：yg1 ~ yg11，作为备用域名池，避免一次性塞太多，默认只放前几个。
 const YONGGE_DOMAINS = Array.from({ length: 11 }, (_, i) => `yg${i + 1}.ygkkk.dpdns.org`);
-const LA_MODE_DEFAULT_TOP = 30;
-const TEAM_MODE_DEFAULT_TOP = 40;           // 多人共用模式默认输出更多候选入口
+const LA_MODE_DEFAULT_TOP = 25;
+const TEAM_MODE_DEFAULT_TOP = 25;           // 多人共用模式也控制在 20～25，避免手机端批量测速失败
 
 function clampNumber(value, min, max, fallback) {
     const n = Number.parseInt(value, 10);
@@ -321,9 +323,88 @@ function dedupeLinks(links) {
     return result;
 }
 
+function normalizeOutputLimit(maxNodes) {
+    // 统一把输出数量控制在 20～25 左右；即使 URL 传 top=40，也不会全量塞给手机端。
+    return clampNumber(maxNodes, BALANCED_MIN_NODES, BALANCED_MAX_NODES, DEFAULT_MAX_NODES);
+}
+
 function limitLinks(links, maxNodes) {
-    const limit = clampNumber(maxNodes, 1, MAX_NODES_HARD_LIMIT, DEFAULT_MAX_NODES);
+    const limit = normalizeOutputLimit(maxNodes);
     return links.slice(0, limit);
+}
+
+function dedupeLinkList(links) {
+    return dedupeLinks(Array.isArray(links) ? links : []);
+}
+
+function buildBalancedCandidateLinks(sourceBuckets, url, request, maxNodes, sourceFlags) {
+    const target = normalizeOutputLimit(maxNodes);
+    const result = [];
+    const seen = new Set();
+
+    function pushOne(link) {
+        if (!link) return false;
+        const key = String(link).split('#')[0];
+        if (seen.has(key)) return false;
+        seen.add(key);
+        result.push(link);
+        return true;
+    }
+
+    function prepareBucket(name) {
+        const list = dedupeLinkList(sourceBuckets?.[name] || []);
+        return personalizeLinksForUser(list, url, request);
+    }
+
+    const origin = prepareBucket('origin');
+    const domain = sourceFlags.epd ? prepareBucket('domain') : [];
+    const ip = sourceFlags.epi ? prepareBucket('ip') : [];
+    const github = sourceFlags.egi ? prepareBucket('github') : [];
+
+    // 原生地址始终保留 1 个兜底，不参与大量占位。
+    if (origin.length > 0) pushOne(origin[0]);
+
+    const enabledBuckets = [];
+    if (domain.length > 0) enabledBuckets.push({ name: 'domain', items: domain, cursor: 0 });
+    if (ip.length > 0) enabledBuckets.push({ name: 'ip', items: ip, cursor: 0 });
+    if (github.length > 0) enabledBuckets.push({ name: 'github', items: github, cursor: 0 });
+
+    if (enabledBuckets.length === 0) {
+        return result.length > 0 ? result : dedupeLinkList([...(sourceBuckets?.origin || []), ...(sourceBuckets?.domain || []), ...(sourceBuckets?.ip || []), ...(sourceBuckets?.github || [])]).slice(0, target);
+    }
+
+    const remainingTarget = Math.max(target - result.length, 0);
+    const baseQuota = Math.floor(remainingTarget / enabledBuckets.length);
+    let extra = remainingTarget % enabledBuckets.length;
+
+    // 第一轮：按已启用来源均衡取数，避免“域名+IP+GitHub全开”时节点爆炸，也避免某一类把前排全占满。
+    for (const bucket of enabledBuckets) {
+        const quota = baseQuota + (extra-- > 0 ? 1 : 0);
+        let taken = 0;
+        while (bucket.cursor < bucket.items.length && taken < quota && result.length < target) {
+            if (pushOne(bucket.items[bucket.cursor])) taken++;
+            bucket.cursor++;
+        }
+    }
+
+    // 第二轮：如果某类候选不足，则从其他已启用来源补齐到 20～25。
+    let progress = true;
+    while (result.length < target && progress) {
+        progress = false;
+        for (const bucket of enabledBuckets) {
+            while (bucket.cursor < bucket.items.length && result.length < target) {
+                const ok = pushOne(bucket.items[bucket.cursor]);
+                bucket.cursor++;
+                if (ok) {
+                    progress = true;
+                    break;
+                }
+            }
+            if (result.length >= target) break;
+        }
+    }
+
+    return result;
 }
 
 function yamlQuote(value) {
@@ -840,6 +921,7 @@ function generateLinksFromNewIPs(list, user, workerDomain, customPath = '/', ech
 async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, evEnabled, etEnabled, vmEnabled, disableNonTLS, customPath, echConfig = null, maxNodes = DEFAULT_MAX_NODES, sourceFlags = { epd: true, epi: true, egi: true }) {
     const url = new URL(request.url);
     const finalLinks = [];
+    const sourceBuckets = { origin: [], domain: [], ip: [], github: [] };
     const workerDomain = url.hostname;  // workerDomain始终是请求的hostname
     const nodeDomain = customDomain || url.hostname;  // 用户输入的域名用于生成节点时的host/sni
     const target = url.searchParams.get('target') || 'base64';
@@ -851,42 +933,46 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
         ? TEAM_MODE_DEFAULT_TOP
         : (!url.searchParams.has('top') && laMode
             ? LA_MODE_DEFAULT_TOP
-            : clampNumber(maxNodes, 1, MAX_NODES_HARD_LIMIT, DEFAULT_MAX_NODES));
+            : normalizeOutputLimit(maxNodes));
 
-    async function addNodesFromList(list) {
+    async function addNodesFromList(list, sourceName = 'github') {
         if (!Array.isArray(list) || list.length === 0) return;
         const hasProtocol = evEnabled || etEnabled || vmEnabled;
         const useVL = hasProtocol ? evEnabled : true;  // 如果没有选择任何协议，默认使用VLESS
+        const generated = [];
         
         if (useVL) {
-            finalLinks.push(...generateLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath, echConfig));
+            generated.push(...generateLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath, echConfig));
         }
         if (etEnabled) {
-            finalLinks.push(...await generateTrojanLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath, echConfig));
+            generated.push(...await generateTrojanLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath, echConfig));
         }
         if (vmEnabled) {
-            finalLinks.push(...generateVMessLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath, echConfig));
+            generated.push(...generateVMessLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath, echConfig));
         }
+
+        const bucketName = ['origin', 'domain', 'ip', 'github'].includes(sourceName) ? sourceName : 'github';
+        sourceBuckets[bucketName].push(...generated);
+        finalLinks.push(...generated);
     }
 
     // 原生地址
-    await addNodesFromList([{ ip: workerDomain, isp: '原生地址' }]);
+    await addNodesFromList([{ ip: workerDomain, isp: '原生地址' }], 'origin');
 
     // 优选域名：内置稳定域名 + 洛杉矶模式下少量补充 BestCF 动态域名
     if (sourceFlags.epd) {
         const domainList = directDomains.map(d => ({ ip: d.domain, isp: d.name || d.domain }));
-        await addNodesFromList(domainList);
-        if (laMode) {
-            const bestcfDomains = await cachedFetchDomainsFromUrl(BESTCF_DOMAIN_URL, 'BestCF动态域名', 6);
-            await addNodesFromList(bestcfDomains);
-        }
+        await addNodesFromList(domainList, 'domain');
+        // 无论是否开启 LA/team，只要启用优选域名，就补充动态域名池；最终由均衡限额控制总量在 20～25。
+        const bestcfDomains = await cachedFetchDomainsFromUrl(BESTCF_DOMAIN_URL, 'BestCF动态域名', 25);
+        await addNodesFromList(bestcfDomains, 'domain');
     }
 
     // 优选IP：加入缓存，第三方源失败时不影响已有缓存
     if (sourceFlags.epi) {
         try {
             const dynamicIPList = await cachedFetchDynamicIPs(ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom);
-            await addNodesFromList(dynamicIPList);
+            await addNodesFromList(dynamicIPList, 'ip');
         } catch (error) {
             console.error('获取动态IP失败:', error);
         }
@@ -901,8 +987,8 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
             if (ispUnicom) sourceUrls.push(BESTCF_CUCC_IP_URL);
             if (ispTelecom) sourceUrls.push(BESTCF_CTCC_IP_URL);
             for (const sourceUrl of sourceUrls) {
-                const list = await cachedFetchAddressListFromUrl(sourceUrl, 443, 40);
-                await addNodesFromList(list);
+                const list = await cachedFetchAddressListFromUrl(sourceUrl, 443, 30);
+                await addNodesFromList(list, 'github');
             }
         } catch (error) {
             console.error('洛杉矶模式 BestCF 源获取失败:', error);
@@ -915,7 +1001,7 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
             if (piu && piu.toLowerCase().startsWith('https://')) {
                 const 优选API的IP = await cachedRequestOptimizeAPI([piu]);
                 const IP列表 = 优选API的IP.map(item => parsePreferredAddress(item, 443)).filter(Boolean);
-                await addNodesFromList(IP列表);
+                await addNodesFromList(IP列表, 'github');
             } else if (piu && piu.includes('\n')) {
                 const 完整优选列表 = await 整理成数组(piu);
                 const 优选API = [], 优选IP = [];
@@ -930,24 +1016,22 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
                     优选IP.push(...await cachedRequestOptimizeAPI(优选API));
                 }
                 const IP列表 = 优选IP.map(item => parsePreferredAddress(item, 443)).filter(Boolean);
-                await addNodesFromList(IP列表);
+                await addNodesFromList(IP列表, 'github');
             } else {
                 const newIPList = await cachedFetchAndParseNewIPs(piu);
-                await addNodesFromList(newIPList);
+                await addNodesFromList(newIPList, 'github');
             }
         } catch (error) {
             console.error('获取优选IP失败:', error);
         }
     }
 
-    let candidateLinks = dedupeLinks(finalLinks);
     // 兼容旧订阅链接：如果没有额外填写 uid/client/user，就自动使用路径里的 UUID/Password 作为稳定打散种子。
-    // 这样每个人旧链接里的 UUID 不同，也会拿到不同顺序的 20～30 个候选入口；新链接仍可显式传 uid 覆盖。
+    // 这样每个人旧链接里的 UUID 不同，也会拿到不同顺序的 20～25 个候选入口；新链接仍可显式传 uid 覆盖。
     if (!url.searchParams.has('uid') && !url.searchParams.has('client') && !url.searchParams.has('user')) {
         url.searchParams.set('uid', String(user || ''));
     }
-    candidateLinks = personalizeLinksForUser(candidateLinks, url, request);
-    let outputLinks = limitLinks(candidateLinks, maxOutputNodes);
+    let outputLinks = buildBalancedCandidateLinks(sourceBuckets, url, request, maxOutputNodes, sourceFlags);
 
     if (outputLinks.length === 0) {
         const errorRemark = '所有节点获取失败';
@@ -1554,14 +1638,14 @@ function generateHomePage(scuValue) {
 
             <div class="form-group">
                 <label>最大输出节点数</label>
-                <input type="number" id="maxNodes" placeholder="建议 10-30" value="20" min="1" max="80">
-                <small style="display: block; margin-top: 6px; color: #86868b; font-size: 13px;">建议只保留 Top 10～30，节点过多会拖慢客户端测速和导入。</small>
+                <input type="number" id="maxNodes" placeholder="建议 20-25" value="25" min="20" max="25">
+                <small style="display: block; margin-top: 6px; color: #86868b; font-size: 13px;">建议固定 20～25 个候选入口，节点过多会拖慢手机端测速。</small>
             </div>
 
             <div class="list-item" onclick="toggleSwitch('switchLA')">
                 <div>
                     <div class="list-item-label">洛杉矶 VPS 推荐模式</div>
-                    <div class="list-item-description">启用后自动接入 BestCF 通用及分运营商源，建议输出 30 个节点。</div>
+                    <div class="list-item-description">启用后自动接入 BestCF 通用及分运营商源，仍控制在 20～25 个节点。</div>
                 </div>
                 <div class="switch" id="switchLA"></div>
             </div>
@@ -1727,8 +1811,8 @@ function generateHomePage(scuValue) {
             }
             if (id === 'switchLA') {
                 const maxNodesInput = document.getElementById('maxNodes');
-                if (maxNodesInput && switches.switchLA && (!maxNodesInput.value || maxNodesInput.value === '20')) {
-                    maxNodesInput.value = '30';
+                if (maxNodesInput && switches.switchLA && (!maxNodesInput.value || Number(maxNodesInput.value) < 20)) {
+                    maxNodesInput.value = '25';
                 }
             }
         }
@@ -1787,7 +1871,7 @@ function generateHomePage(scuValue) {
             const uuid = document.getElementById('uuid').value.trim();
             const subToken = document.getElementById('subToken').value.trim();
             const customPath = document.getElementById('customPath').value.trim() || '/';
-            const maxNodes = document.getElementById('maxNodes').value.trim() || '20';
+            const maxNodes = document.getElementById('maxNodes').value.trim() || '25';
             
             if (!domain || !uuid) {
                 alert('请先填写域名和UUID/Password');
