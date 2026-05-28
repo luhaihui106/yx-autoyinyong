@@ -1951,7 +1951,7 @@ export default {
             const customPath = normalizeWsPath(url.searchParams.get('path') || env?.WS_PATH || '/');
 
             return await handleSubscriptionRequest(
-                request，
+                request,
                 uuid,
                 domain,
                 piu,
