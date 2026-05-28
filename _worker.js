@@ -1,4 +1,5 @@
-// Cloudflare Worker - 简化版优选工具
+// Cloudflare Worker - 服务器优选工具 最终版 v6
+// 基于当前线上 _worker.js 更新：候选池上限 60；仅优选IP输出18；其余有效组合默认25、可top=30；保留旧链接兼容。
 // 仅保留优选域名、优选IP、GitHub、上报和节点生成功能
 // 修复记录：已修正 VMess 协议下节点名称包含中文导致 Error 1101 的问题
 
@@ -22,10 +23,12 @@ let customECHDomain = 'cloudflare-ech.com';
 // Worker 内存缓存：减少每次订阅实时拉取第三方优选源导致的慢、超时、失败。
 // 注意：Cloudflare Worker 冷启动后缓存会清空，这是正常现象；如需强持久缓存，可后续接 KV。
 const CACHE_TTL_MS = 60 * 60 * 1000;       // 优选源缓存 60 分钟：减少第三方源拉取，适合多人订阅
-const DEFAULT_MAX_NODES = 25;              // 默认输出约 20～25 个节点，避免手机端全量测速被拖垮
-const BALANCED_MIN_NODES = 20;             // 有可用候选时，尽量不少于 20 个
-const BALANCED_MAX_NODES = 25;             // 无论优选域名/IP/GitHub如何搭配，默认最多 25 个
-const MAX_NODES_HARD_LIMIT = 25;           // 硬限制，防止 URL 参数传入过大导致客户端测速失败
+const DEFAULT_MAX_NODES = 25;              // 默认输出 25 个节点；普通/电脑端可通过 top 调整到 30
+const NORMAL_MIN_NODES = 25;               // 除“仅优选IP”外，其余有效组合默认不少于 25 个
+const NORMAL_MAX_NODES = 30;               // 除“仅优选IP”外，其余有效组合允许输出到 30 个
+const ONLY_IP_MAX_NODES = 18;              // 仅启用优选IP时控制在 18 个，避免动态IP源不足或质量波动拖垮测速
+const MAX_NODES_HARD_LIMIT = 30;           // 硬限制，防止 URL 参数传入过大导致客户端测速失败
+const MAX_CANDIDATE_POOL_SIZE = 60;        // 后台候选池上限：先按 UUID 打散，再从最多 60 个候选中按规则输出 18/25/30 个
 const memoryCache = new Map();
 
 const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
@@ -323,9 +326,27 @@ function dedupeLinks(links) {
     return result;
 }
 
+function isOnlyIpSourceFlags(sourceFlags = {}) {
+    return !sourceFlags.epd && !!sourceFlags.epi && !sourceFlags.egi;
+}
+
+function hasAnyPreferredSource(sourceFlags = {}) {
+    return !!(sourceFlags.epd || sourceFlags.epi || sourceFlags.egi);
+}
+
 function normalizeOutputLimit(maxNodes) {
-    // 统一把输出数量控制在 20～25 左右；即使 URL 传 top=40，也不会全量塞给手机端。
-    return clampNumber(maxNodes, BALANCED_MIN_NODES, BALANCED_MAX_NODES, DEFAULT_MAX_NODES);
+    // 普通组合默认 25 个，可通过 top 调整到 30 个；不再把 top=30 截断为 25。
+    return clampNumber(maxNodes, NORMAL_MIN_NODES, NORMAL_MAX_NODES, DEFAULT_MAX_NODES);
+}
+
+function resolveTargetNodeCount(maxNodes, sourceFlags = {}) {
+    if (!hasAnyPreferredSource(sourceFlags)) return 1;
+    // 仅启用优选IP时：目标控制在 18 个；若动态IP不足，后续从域名/GitHub池补位。
+    if (isOnlyIpSourceFlags(sourceFlags)) {
+        return clampNumber(maxNodes, 1, ONLY_IP_MAX_NODES, ONLY_IP_MAX_NODES);
+    }
+    // 其余 6 种有效组合：默认/最低 25 个，电脑端可 top=30。
+    return normalizeOutputLimit(maxNodes);
 }
 
 function limitLinks(links, maxNodes) {
@@ -337,8 +358,57 @@ function dedupeLinkList(links) {
     return dedupeLinks(Array.isArray(links) ? links : []);
 }
 
+
+function limitPreparedCandidateBuckets(preparedBuckets, sourceFlags, maxCandidates, onlyIpMode = false) {
+    const limit = Math.max(Number.parseInt(maxCandidates, 10) || MAX_CANDIDATE_POOL_SIZE, 1);
+    const names = [];
+
+    // 仅优选IP模式下，IP 是主力；域名和 GitHub/BestCF 只作为补位池。
+    if (onlyIpMode) {
+        names.push('ip', 'domain', 'github');
+    } else {
+        if (sourceFlags.epd) names.push('domain');
+        if (sourceFlags.epi) names.push('ip');
+        if (sourceFlags.egi) names.push('github');
+    }
+
+    const result = { domain: [], ip: [], github: [] };
+    if (names.length === 0) return result;
+
+    const baseQuota = Math.floor(limit / names.length);
+    let extra = limit % names.length;
+    const cursors = {};
+
+    for (const name of names) {
+        const quota = baseQuota + (extra-- > 0 ? 1 : 0);
+        const source = preparedBuckets[name] || [];
+        result[name] = source.slice(0, quota);
+        cursors[name] = result[name].length;
+    }
+
+    // 某个来源不足时，用其他已启用来源补满候选池上限，避免候选池过小导致不同 UUID 重复率过高。
+    let total = Object.values(result).reduce((sum, list) => sum + list.length, 0);
+    let progress = true;
+    while (total < limit && progress) {
+        progress = false;
+        for (const name of names) {
+            const source = preparedBuckets[name] || [];
+            const cursor = cursors[name] || 0;
+            if (cursor < source.length) {
+                result[name].push(source[cursor]);
+                cursors[name] = cursor + 1;
+                total++;
+                progress = true;
+                if (total >= limit) break;
+            }
+        }
+    }
+
+    return result;
+}
+
 function buildBalancedCandidateLinks(sourceBuckets, url, request, maxNodes, sourceFlags) {
-    const target = normalizeOutputLimit(maxNodes);
+    const target = resolveTargetNodeCount(maxNodes, sourceFlags);
     const result = [];
     const seen = new Set();
 
@@ -357,12 +427,47 @@ function buildBalancedCandidateLinks(sourceBuckets, url, request, maxNodes, sour
     }
 
     const origin = prepareBucket('origin');
-    const domain = sourceFlags.epd ? prepareBucket('domain') : [];
-    const ip = sourceFlags.epi ? prepareBucket('ip') : [];
-    const github = sourceFlags.egi ? prepareBucket('github') : [];
+    let allDomain = prepareBucket('domain');
+    let allIp = prepareBucket('ip');
+    let allGithub = prepareBucket('github');
+    const onlyIpMode = isOnlyIpSourceFlags(sourceFlags);
+
+    const candidateLimit = Math.max(MAX_CANDIDATE_POOL_SIZE - (origin.length > 0 ? 1 : 0), 1);
+    const limitedCandidates = limitPreparedCandidateBuckets(
+        { domain: allDomain, ip: allIp, github: allGithub },
+        sourceFlags,
+        candidateLimit,
+        onlyIpMode
+    );
+    allDomain = limitedCandidates.domain;
+    allIp = limitedCandidates.ip;
+    allGithub = limitedCandidates.github;
+
+    const domain = sourceFlags.epd ? allDomain : [];
+    const ip = sourceFlags.epi ? allIp : [];
+    const github = sourceFlags.egi ? allGithub : [];
 
     // 原生地址始终保留 1 个兜底，不参与大量占位。
     if (origin.length > 0) pushOne(origin[0]);
+
+    // 仅启用优选IP时：优先取动态优选IP；不足 18 时，再从优选域名池、GitHub/BestCF池补位。
+    // 这样解决“只开优选IP只有十几个节点”的问题，同时不把目标数拉高到 25+。
+    if (onlyIpMode) {
+        const fallbackBuckets = [
+            { name: 'ip', items: allIp, cursor: 0 },
+            { name: 'domain-fill', items: allDomain, cursor: 0 },
+            { name: 'github-fill', items: allGithub, cursor: 0 }
+        ].filter(bucket => bucket.items.length > 0);
+
+        for (const bucket of fallbackBuckets) {
+            while (bucket.cursor < bucket.items.length && result.length < target) {
+                pushOne(bucket.items[bucket.cursor]);
+                bucket.cursor++;
+            }
+            if (result.length >= target) break;
+        }
+        return result;
+    }
 
     const enabledBuckets = [];
     if (domain.length > 0) enabledBuckets.push({ name: 'domain', items: domain, cursor: 0 });
@@ -387,7 +492,7 @@ function buildBalancedCandidateLinks(sourceBuckets, url, request, maxNodes, sour
         }
     }
 
-    // 第二轮：如果某类候选不足，则从其他已启用来源补齐到 20～25。
+    // 第二轮：如果某类候选不足，则从其他已启用来源补齐到目标数量。
     let progress = true;
     while (result.length < target && progress) {
         progress = false;
@@ -446,6 +551,11 @@ const directDomains = [
     { name: 'cf0sm', domain: 'cf.0sm.com' },
     { name: 'saas-sin-fan', domain: 'saas.sin.fan' },
     { name: 'xn-b6gac', domain: 'xn--b6gac.eu.org' },
+    { name: 'cnae-cf', domain: 'cf.cnae.top' },
+    { name: 'cf-22336666', domain: 'cloudflare.22336666.xyz' },
+    { name: 'cloudflare-cnae', domain: 'cloudflare.cnae.top' },
+    { name: 'cloudflare-byoip', domain: 'cloudflare.byoip.top' },
+    { name: 'cf-19931110', domain: 'cloudflare.19931110.xyz' },
     { name: 'yongge-1', domain: YONGGE_DOMAINS[0] },
     { name: 'yongge-2', domain: YONGGE_DOMAINS[1] },
     { name: 'yongge-3', domain: YONGGE_DOMAINS[2] }
@@ -929,11 +1039,8 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
     const profile = url.searchParams.get('mode') || url.searchParams.get('profile') || '';
     const laMode = isLosAngelesMode(profile);
     const teamMode = isTeamMode(profile) || ['yes', 'true', '1', 'on'].includes(String(url.searchParams.get('team') || '').toLowerCase());
-    const maxOutputNodes = !url.searchParams.has('top') && teamMode
-        ? TEAM_MODE_DEFAULT_TOP
-        : (!url.searchParams.has('top') && laMode
-            ? LA_MODE_DEFAULT_TOP
-            : normalizeOutputLimit(maxNodes));
+    const onlyIpMode = isOnlyIpSourceFlags(sourceFlags);
+    const maxOutputNodes = resolveTargetNodeCount(maxNodes, sourceFlags);
 
     async function addNodesFromList(list, sourceName = 'github') {
         if (!Array.isArray(list) || list.length === 0) return;
@@ -960,10 +1067,10 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
     await addNodesFromList([{ ip: workerDomain, isp: '原生地址' }], 'origin');
 
     // 优选域名：内置稳定域名 + 洛杉矶模式下少量补充 BestCF 动态域名
-    if (sourceFlags.epd) {
+    if (sourceFlags.epd || onlyIpMode) {
         const domainList = directDomains.map(d => ({ ip: d.domain, isp: d.name || d.domain }));
         await addNodesFromList(domainList, 'domain');
-        // 无论是否开启 LA/team，只要启用优选域名，就补充动态域名池；最终由均衡限额控制总量在 20～25。
+        // 无论是否开启 LA/team，只要启用优选域名，就补充动态域名池；最终先按 UUID 打散并控制候选池上限，再按规则输出。
         const bestcfDomains = await cachedFetchDomainsFromUrl(BESTCF_DOMAIN_URL, 'BestCF动态域名', 25);
         await addNodesFromList(bestcfDomains, 'domain');
     }
@@ -996,7 +1103,7 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
     }
 
     // GitHub优选 / 自定义优选API：统一解析后交给 addNodesFromList，保证 VLESS/Trojan/VMess 选择都生效
-    if (sourceFlags.egi) {
+    if (sourceFlags.egi || onlyIpMode) {
         try {
             if (piu && piu.toLowerCase().startsWith('https://')) {
                 const 优选API的IP = await cachedRequestOptimizeAPI([piu]);
@@ -1638,8 +1745,8 @@ function generateHomePage(scuValue) {
 
             <div class="form-group">
                 <label>最大输出节点数</label>
-                <input type="number" id="maxNodes" placeholder="建议 20-25" value="25" min="20" max="25">
-                <small style="display: block; margin-top: 6px; color: #86868b; font-size: 13px;">建议固定 20～25 个候选入口，节点过多会拖慢手机端测速。</small>
+                <input type="number" id="maxNodes" placeholder="普通建议25，电脑可30；仅优选IP自动18" value="25" min="18" max="30">
+                <small style="display: block; margin-top: 6px; color: #86868b; font-size: 13px;">普通组合默认 25 个、可到 30 个；仅启用优选IP时自动控制在 18 个并从其他池补位。</small>
             </div>
 
             <div class="list-item" onclick="toggleSwitch('switchLA')">
@@ -2107,6 +2214,7 @@ export default {
             const epiEnabled = url.searchParams.get('epi') !== 'no';
             const egiEnabled = url.searchParams.get('egi') !== 'no';
             const piu = url.searchParams.get('piu') || env?.PIU || defaultIPURL;
+            // top 仅作为期望值：仅优选IP模式会自动压到 18；其余有效组合默认/最低 25，最高 30。
             const maxNodes = clampNumber(url.searchParams.get('top') || env?.MAX_NODES || DEFAULT_MAX_NODES, 1, MAX_NODES_HARD_LIMIT, DEFAULT_MAX_NODES);
             
             // 协议选择
